@@ -352,27 +352,27 @@ def fmt_money(v):
 
 def fmt_duration(seconds):
     if seconds < 60:
-        return f"{seconds}s"
+        return f"{seconds} сек"
     m, s = divmod(seconds, 60)
     if m < 60:
-        return f"{m}m {s}s"
+        return f"{m} мин {s} сек"
     h, rem = divmod(m, 60)
-    return f"{h}h {rem}m"
+    return f"{h} ч {rem} мин"
 
 def opp_text(o):
     return (
-        f"🔥 CEX ARBITRAGE\n{o.base}/USDT\n\n"
-        f"🟢 BUY  {o.buy_exchange}\n"
-        f"Price: {fmt_price(o.exec_buy_avg)}\n\n"
-        f"🔴 SELL {o.sell_exchange}\n"
-        f"Price: {fmt_price(o.exec_sell_avg)}\n\n"
-        f"Spread top: +{o.gross_pct:.3f}%\n"
-        f"REAL NET: +{o.exec_net_pct:.3f}%\n"
-        f"Available amount: $" + f"{o.exec_amount_usdt:.2f}\n"
-        f"Est. profit: $" + f"{o.exec_profit_usdt:.2f}\n"
-        f"Alive: {fmt_duration(o.alive_seconds)}\n"
-        f"24h liquidity floor: {fmt_money(o.min_quote_volume_24h)}\n\n"
-        f"⚠️ Before transfer verify common network, deposit/withdraw status and withdrawal fee."
+        f"🔥 ЛУЧШИЙ АРБИТРАЖ\n{o.base}/USDT\n\n"
+        f"🟢 КУПИТЬ: {o.buy_exchange}\n"
+        f"Цена: {fmt_price(o.exec_buy_avg)}\n\n"
+        f"🔴 ПРОДАТЬ: {o.sell_exchange}\n"
+        f"Цена: {fmt_price(o.exec_sell_avg)}\n\n"
+        f"Спред по лучшим ценам: +{o.gross_pct:.3f}%\n"
+        f"РЕАЛЬНЫЙ NET: +{o.exec_net_pct:.3f}%\n"
+        f"Рабочий объём: $" + f"{o.exec_amount_usdt:.2f}\n"
+        f"Ожидаемая прибыль: $" + f"{o.exec_profit_usdt:.2f}\n"
+        f"Спред живёт: {fmt_duration(o.alive_seconds)}\n"
+        f"24ч ликвидность: {fmt_money(o.min_quote_volume_24h)}\n\n"
+        f"⚠️ Перед переводом проверь общую сеть, ввод/вывод и комиссию сети."
     )
 
 async def send_telegram(session, text):
@@ -386,7 +386,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v4 — 6 exchanges")
+    log.info("Starting CEX arbitrage scanner v5 — RU + best route per coin")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
     log.info("Reject gross spread above: %.2f%%", MAX_GROSS_SPREAD_PCT)
@@ -440,6 +440,16 @@ async def main():
                               key=lambda x:(x.exec_profit_usdt, x.exec_net_pct),
                               reverse=True)
 
+                # Только одна лучшая связка на монету.
+                best_by_base = {}
+                for o in opps:
+                    current = best_by_base.get(o.base)
+                    if current is None or (o.exec_profit_usdt, o.exec_net_pct) > (current.exec_profit_usdt, current.exec_net_pct):
+                        best_by_base[o.base] = o
+                opps = sorted(best_by_base.values(),
+                              key=lambda x:(x.exec_profit_usdt, x.exec_net_pct),
+                              reverse=True)
+
                 for o in opps[:5]:
                     log.info("TOP %s %s->%s | amount $%.2f | net %.3f%% | profit $%.2f | alive %ss",
                              o.base, o.buy_exchange, o.sell_exchange,
@@ -449,7 +459,7 @@ async def main():
                 sent = 0
                 for o in opps:
                     if sent >= MAX_ALERTS_PER_CYCLE: break
-                    key = (o.base,o.buy_exchange,o.sell_exchange)
+                    key = o.base
                     if now-last_alert.get(key,0) < ALERT_COOLDOWN_SECONDS: continue
                     msg = opp_text(o)
                     log.info("\n%s", msg)
