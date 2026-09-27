@@ -213,21 +213,28 @@ async def fetch_okx(session):
     return out
 
 def norm_network(name):
-    s = str(name or "").upper().replace(" ", "").replace("-", "").replace("_", "")
-    aliases = {
-        "ERC20": "ETH", "ETHEREUM": "ETH", "ETH": "ETH",
-        "BEP20": "BSC", "BSC": "BSC", "BNBSMARTCHAIN": "BSC",
-        "TRC20": "TRX", "TRON": "TRX", "TRX": "TRX",
-        "ARBITRUMONE": "ARBITRUM", "ARBITRUM": "ARBITRUM", "ARB": "ARBITRUM",
-        "OPTIMISM": "OPTIMISM", "OP": "OPTIMISM",
-        "SOLANA": "SOL", "SOL": "SOL",
-        "POLYGON": "POLYGON", "MATIC": "POLYGON",
-        "AVALANCHECCHAIN": "AVAXC", "AVAXC": "AVAXC",
-        "INJECTIVE": "INJ", "INJ": "INJ",
-        "HARMONY": "ONE", "ONE": "ONE",
-        "BASE": "BASE"
-    }
-    return aliases.get(s, s)
+    raw = str(name or "").upper().strip()
+    s = "".join(ch for ch in raw if ch.isalnum())
+
+    rules = [
+        (("INJECTIVE", "INJECTIVENETWORK", "INJ"), "INJ"),
+        (("ETHEREUM", "ERC20", "ETH"), "ETH"),
+        (("BNBSMARTCHAIN", "BEP20", "BSC"), "BSC"),
+        (("TRON", "TRC20", "TRX"), "TRX"),
+        (("ARBITRUMONE", "ARBITRUM", "ARB"), "ARBITRUM"),
+        (("OPTIMISM",), "OPTIMISM"),
+        (("SOLANA", "SOL"), "SOL"),
+        (("POLYGON", "MATIC"), "POLYGON"),
+        (("AVALANCHECCHAIN", "AVAXC"), "AVAXC"),
+        (("HARMONY", "HARMONYONE", "ONE"), "ONE"),
+        (("BASE",), "BASE"),
+    ]
+    for aliases, canonical in rules:
+        for alias in aliases:
+            a = "".join(ch for ch in alias if ch.isalnum())
+            if s == a or s.startswith(a) or a in s:
+                return canonical
+    return s
 
 async def fetch_htx_networks(session):
     d = await get_json(session, f"{HTX_BASE}/v2/reference/currencies", {"authorizedUser":"false"})
@@ -236,7 +243,7 @@ async def fetch_htx_networks(session):
         base = str(coin.get("currency", "")).upper()
         rows = []
         for ch in coin.get("chains", []):
-            raw_name = ch.get("displayName") or ch.get("baseChainProtocol") or ch.get("baseChain") or ch.get("chain")
+            raw_name = ch.get("baseChainProtocol") or ch.get("baseChain") or ch.get("displayName") or ch.get("chain")
             fee_type = str(ch.get("withdrawFeeType", "")).lower()
             fee = fnum(ch.get("transactFeeWithdraw")) if fee_type == "fixed" else fnum(ch.get("minTransactFeeWithdraw"))
             rows.append({"network": norm_network(raw_name), "raw": raw_name or ch.get("chain",""),
@@ -304,7 +311,7 @@ def choose_common_network(o, catalog):
     for s in src:
         if not s.get("withdraw"): continue
         for d in dst_by_net.get(s.get("network"), []): candidates.append((s, d))
-    if not candidates: return None
+    if not candidates:\n        if src and dst:\n            log.info("NETWORK_MISS %s %s->%s | src=%s | dst=%s",\n                     o.base, o.buy_exchange, o.sell_exchange,\n                     [(x.get("raw"), x.get("network"), x.get("withdraw")) for x in src],\n                     [(x.get("raw"), x.get("network"), x.get("deposit")) for x in dst])\n        return None
     candidates.sort(key=lambda x: x[0].get("fee", 0.0))
     return candidates[0]
 
@@ -532,7 +539,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v9 — transparent network fee logging")
+    log.info("Starting CEX arbitrage scanner v10 — improved network matching")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
