@@ -10,7 +10,10 @@ import aiohttp
 
 BINANCE_BASE = "https://api.binance.com"
 BYBIT_BASE = "https://api.bybit.com"
-OKX_BASE = "https://www.okx.com"\nHTX_BASE = "https://api.huobi.pro"\nKUCOIN_BASE = "https://api.kucoin.com"\nMEXC_BASE = "https://api.mexc.com"
+OKX_BASE = "https://www.okx.com"
+HTX_BASE = "https://api.huobi.pro"
+KUCOIN_BASE = "https://api.kucoin.com"
+MEXC_BASE = "https://api.mexc.com"
 
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
 MIN_NET_SPREAD_PCT = float(os.getenv("MIN_NET_SPREAD_PCT", "0.20"))
@@ -24,6 +27,9 @@ FEES_PCT = {
     "BINANCE": float(os.getenv("BINANCE_FEE_PCT", "0.10")),
     "BYBIT": float(os.getenv("BYBIT_FEE_PCT", "0.10")),
     "OKX": float(os.getenv("OKX_FEE_PCT", "0.10")),
+    "HTX": float(os.getenv("HTX_FEE_PCT", "0.20")),
+    "KUCOIN": float(os.getenv("KUCOIN_FEE_PCT", "0.10")),
+    "MEXC": float(os.getenv("MEXC_FEE_PCT", "0.10")),
 }
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
