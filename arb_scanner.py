@@ -22,6 +22,7 @@ MAX_TRADE_USDT = float(os.getenv("MAX_TRADE_USDT", "100"))
 MIN_TRADE_USDT = float(os.getenv("MIN_TRADE_USDT", "10"))
 MAX_GROSS_SPREAD_PCT = float(os.getenv("MAX_GROSS_SPREAD_PCT", "8.0"))
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "90"))
+REARM_SECONDS = int(os.getenv("REARM_SECONDS", "120"))
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "5"))
 
 FEES_PCT = {
@@ -386,7 +387,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v5 — RU + best route per coin")
+    log.info("Starting CEX arbitrage scanner v6 — persistent anti-spam per coin")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
     log.info("Reject gross spread above: %.2f%%", MAX_GROSS_SPREAD_PCT)
@@ -394,6 +395,8 @@ async def main():
     headers = {"User-Agent":"cex-arb-scanner/railway-v2"}
     last_alert = {}
     first_seen = {}
+    alerted_bases = set()
+    inactive_since = {}
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         while True:
             started = time.time()
@@ -450,6 +453,19 @@ async def main():
                               key=lambda x:(x.exec_profit_usdt, x.exec_net_pct),
                               reverse=True)
 
+                # Повтор по монете запрещён, пока прибыльная возможность не исчезла.
+                active_bases = {o.base for o in opps}
+                for base in list(alerted_bases):
+                    if base in active_bases:
+                        inactive_since.pop(base, None)
+                    else:
+                        if base not in inactive_since:
+                            inactive_since[base] = now
+                        elif now - inactive_since[base] >= REARM_SECONDS:
+                            alerted_bases.discard(base)
+                            inactive_since.pop(base, None)
+                            last_alert.pop(base, None)
+
                 for o in opps[:5]:
                     log.info("TOP %s %s->%s | amount $%.2f | net %.3f%% | profit $%.2f | alive %ss",
                              o.base, o.buy_exchange, o.sell_exchange,
@@ -458,13 +474,26 @@ async def main():
 
                 sent = 0
                 for o in opps:
-                    if sent >= MAX_ALERTS_PER_CYCLE: break
+                    if sent >= MAX_ALERTS_PER_CYCLE:
+                        break
+
                     key = o.base
-                    if now-last_alert.get(key,0) < ALERT_COOLDOWN_SECONDS: continue
+
+                    # Если по этой монете уже был сигнал и возможность всё ещё жива —
+                    # не отправляем повтор, даже если маршрут/процент немного изменился.
+                    if key in alerted_bases:
+                        continue
+
+                    if now-last_alert.get(key,0) < ALERT_COOLDOWN_SECONDS:
+                        continue
+
                     msg = opp_text(o)
                     log.info("\n%s", msg)
                     await send_telegram(session,msg)
+
                     last_alert[key] = now
+                    alerted_bases.add(key)
+                    inactive_since.pop(key, None)
                     sent += 1
             except Exception:
                 log.exception("Unexpected cycle error")
