@@ -532,7 +532,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v8 — network and withdrawal fee aware")
+    log.info("Starting CEX arbitrage scanner v9 — transparent network fee logging")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
@@ -570,6 +570,12 @@ async def main():
                     if fresh_catalog:
                         network_catalog = fresh_catalog
                         network_catalog_ts = now
+                        log.info(
+                            "Network catalog ready | HTX:%d | KUCOIN:%d | MEXC:%d",
+                            len(network_catalog.get("HTX", {})),
+                            len(network_catalog.get("KUCOIN", {})),
+                            len(network_catalog.get("MEXC", {}))
+                        )
 
                 active_keys = set()
                 for o in candidates:
@@ -623,10 +629,23 @@ async def main():
                             last_alert.pop(base, None)
 
                 for o in opps[:5]:
-                    log.info("TOP %s %s->%s | amount $%.2f | trade_net %.3f%% | final_net %.3f%% | final_profit $%.2f | alive %ss",
-                             o.base, o.buy_exchange, o.sell_exchange,
-                             o.exec_amount_usdt, o.exec_net_pct,
-                             o.final_net_pct, o.final_profit_usdt, o.alive_seconds)
+                    if o.network_verified:
+                        fee_source = "REAL"
+                        network = o.network_name or "?"
+                        fee_desc = f"{o.withdraw_fee_token:g} {o.base} (~${o.withdraw_fee_usdt:.2f})"
+                    else:
+                        fee_source = "RESERVE"
+                        network = "UNVERIFIED"
+                        fee_desc = f"${REBALANCE_COST_USDT:.2f}"
+
+                    log.info(
+                        "TOP %s %s->%s | amount $%.2f | trade_net %.3f%% | network=%s | fee_source=%s | withdraw_fee=%s | trade_profit $%.2f | final_net %.3f%% | final_profit $%.2f | alive %ss",
+                        o.base, o.buy_exchange, o.sell_exchange,
+                        o.exec_amount_usdt, o.exec_net_pct,
+                        network, fee_source, fee_desc,
+                        o.exec_profit_usdt, o.final_net_pct,
+                        o.final_profit_usdt, o.alive_seconds
+                    )
 
                 sent = 0
                 for o in opps:
