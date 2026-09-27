@@ -311,7 +311,15 @@ def choose_common_network(o, catalog):
     for s in src:
         if not s.get("withdraw"): continue
         for d in dst_by_net.get(s.get("network"), []): candidates.append((s, d))
-    if not candidates:\n        if src and dst:\n            log.info("NETWORK_MISS %s %s->%s | src=%s | dst=%s",\n                     o.base, o.buy_exchange, o.sell_exchange,\n                     [(x.get("raw"), x.get("network"), x.get("withdraw")) for x in src],\n                     [(x.get("raw"), x.get("network"), x.get("deposit")) for x in dst])\n        return None
+    if not candidates:
+        if src and dst:
+            log.info(
+                "NETWORK_MISS %s %s->%s | src=%s | dst=%s",
+                o.base, o.buy_exchange, o.sell_exchange,
+                [(x.get("raw"), x.get("network"), x.get("withdraw")) for x in src],
+                [(x.get("raw"), x.get("network"), x.get("deposit")) for x in dst]
+            )
+        return None
     candidates.sort(key=lambda x: x[0].get("fee", 0.0))
     return candidates[0]
 
@@ -539,7 +547,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v10 — improved network matching")
+    log.info("Starting CEX arbitrage scanner v10.1 — syntax fix")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
