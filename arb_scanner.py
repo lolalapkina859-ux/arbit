@@ -272,20 +272,54 @@ async def fetch_htx_networks(session):
     return out
 
 async def fetch_kucoin_networks(session):
-    d = await get_json(session, f"{KUCOIN_BASE}/api/v3/currencies")
     out = {}
-    for coin in d.get("data", []):
-        base = str(coin.get("currency", "")).upper()
-        rows = []
-        for ch in coin.get("chains", []):
-            raw_name = ch.get("chainName") or ch.get("chainId")
-            network = canonical_network(ch.get("chainName"), ch.get("chainId"))
-            fee = fnum(ch.get("withdrawMinFee") or ch.get("withdrawalMinFee"))
-            rows.append({"network": network, "raw": raw_name or "",
-                         "withdraw": bool(ch.get("isWithdrawEnabled")),
-                         "deposit": bool(ch.get("isDepositEnabled")),
-                         "fee": fee, "confirms": int(fnum(ch.get("confirms")))})
-        if rows: out[base] = rows
+
+    # Current KuCoin public currency endpoint (UTA).
+    try:
+        d = await get_json(session, f"{KUCOIN_BASE}/api/ua/v2/asset/currencies")
+        rows_data = d.get("data", [])
+        for coin in rows_data:
+            base = str(coin.get("currency", "")).upper()
+            rows = []
+            for ch in coin.get("list", []):
+                raw_name = ch.get("chainName") or ch.get("chain")
+                network = canonical_network(ch.get("chainName"), ch.get("chain"))
+                fee = fnum(ch.get("minWithdrawFee") or ch.get("withdrawMinFee") or ch.get("withdrawalMinFee"))
+                rows.append({
+                    "network": network,
+                    "raw": raw_name or "",
+                    "withdraw": bool(ch.get("isWithdrawEnabled")),
+                    "deposit": bool(ch.get("isDepositEnabled")),
+                    "fee": fee,
+                    "confirms": int(fnum(ch.get("confirms") or ch.get("preConfirms")))
+                })
+            if rows:
+                out[base] = rows
+    except Exception as e:
+        log.warning("KuCoin UTA currency metadata failed: %s", e)
+
+    # Fallback to the classic public endpoint and support both chains[] and list[].
+    if not out:
+        d = await get_json(session, f"{KUCOIN_BASE}/api/v3/currencies")
+        for coin in d.get("data", []):
+            base = str(coin.get("currency", "")).upper()
+            rows = []
+            chain_rows = coin.get("chains") or coin.get("list") or []
+            for ch in chain_rows:
+                raw_name = ch.get("chainName") or ch.get("chainId") or ch.get("chain")
+                network = canonical_network(ch.get("chainName"), ch.get("chainId"), ch.get("chain"))
+                fee = fnum(ch.get("withdrawMinFee") or ch.get("withdrawalMinFee") or ch.get("minWithdrawFee"))
+                rows.append({
+                    "network": network,
+                    "raw": raw_name or "",
+                    "withdraw": bool(ch.get("isWithdrawEnabled")),
+                    "deposit": bool(ch.get("isDepositEnabled")),
+                    "fee": fee,
+                    "confirms": int(fnum(ch.get("confirms") or ch.get("preConfirms")))
+                })
+            if rows:
+                out[base] = rows
+
     return out
 
 async def fetch_mexc_networks(session):
@@ -582,7 +616,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v11 — stronger network matching")
+    log.info("Starting CEX arbitrage scanner v12 — KuCoin network metadata fix")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
