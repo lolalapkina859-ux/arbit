@@ -79,6 +79,8 @@ class Opportunity:
     withdraw_fee_token: float = 0.0
     withdraw_fee_usdt: float = 0.0
     network_note: str = ""
+    network_checked: bool = False
+    network_route_available: bool = False
     alive_seconds: int = 0
     executable: bool = False
 
@@ -531,22 +533,43 @@ async def enrich_with_depth(session, o):
     return o
 
 def apply_network_cost(o, catalog):
+    src_supported = o.buy_exchange in catalog
+    dst_supported = o.sell_exchange in catalog
+    src_rows = catalog.get(o.buy_exchange, {}).get(o.base, [])
+    dst_rows = catalog.get(o.sell_exchange, {}).get(o.base, [])
+
+    o.network_checked = src_supported and dst_supported and bool(src_rows) and bool(dst_rows)
     match = choose_common_network(o, catalog)
+
     if match:
         src, dst = match
         o.network_name = src.get("raw") or src.get("network") or ""
         o.network_verified = True
+        o.network_route_available = True
         o.withdraw_fee_token = fnum(src.get("fee"))
         o.withdraw_fee_usdt = o.withdraw_fee_token * o.exec_buy_avg
         o.network_note = "withdraw ✅ / deposit ✅"
         o.final_profit_usdt = o.exec_profit_usdt - o.withdraw_fee_usdt
         o.final_net_pct = (o.final_profit_usdt / o.exec_amount_usdt) * 100.0 if o.exec_amount_usdt > 0 else -999.0
+    elif o.network_checked:
+        # Both exchanges supplied network metadata for this asset, but no common enabled route exists.
+        o.network_verified = True
+        o.network_route_available = False
+        o.network_note = "нет общей активной сети"
+        o.final_profit_usdt = -999.0
+        o.final_net_pct = -999.0
     else:
         o.network_verified = False
+        o.network_route_available = False
         o.network_note = "сеть не проверена автоматически"
         o.final_profit_usdt = o.exec_profit_usdt - REBALANCE_COST_USDT
         o.final_net_pct = (o.final_profit_usdt / o.exec_amount_usdt) * 100.0 if o.exec_amount_usdt > 0 else -999.0
-    o.executable = o.executable and o.final_profit_usdt >= MIN_FINAL_PROFIT_USDT
+
+    o.executable = (
+        o.executable
+        and (not o.network_checked or o.network_route_available)
+        and o.final_profit_usdt >= MIN_FINAL_PROFIT_USDT
+    )
     return o
 
 def fmt_price(v):
@@ -569,7 +592,7 @@ def fmt_duration(seconds):
     return f"{h} ч {rem} мин"
 
 def opp_text(o):
-    if o.network_verified:
+    if o.network_verified and o.network_route_available:
         network_block = (
             f"🌐 Сеть: {o.network_name}\n"
             f"Вывод с {o.buy_exchange}: ✅\n"
@@ -577,11 +600,14 @@ def opp_text(o):
             f"Комиссия вывода: {o.withdraw_fee_token:g} {o.base} (~${o.withdraw_fee_usdt:.2f})\n"
         )
         cost_line = f"Комиссия сети: -${o.withdraw_fee_usdt:.2f}\n"
+    elif o.network_checked and not o.network_route_available:
+        network_block = (
+            f"🌐 Сеть: ❌ нет общей активной сети\n"
+            f"Связка заблокирована фильтром сети.\n"
+        )
+        cost_line = ""
     else:
-        if o.buy_exchange in ("HTX","KUCOIN","MEXC") and o.sell_exchange in ("HTX","KUCOIN","MEXC"):
-            reason = "Публичные данные есть, но общая активная сеть пока не сопоставлена."
-        else:
-            reason = "Для одной из бирж сеть пока не проверяется автоматически."
+        reason = "Для одной из бирж сеть пока не проверяется автоматически."
         network_block = (
             f"🌐 Сеть: ⚠️ не подтверждена\n"
             f"{reason}\n"
@@ -616,7 +642,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v12 — KuCoin network metadata fix")
+    log.info("Starting CEX arbitrage scanner v13 — reject routes without common active network")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
@@ -680,6 +706,11 @@ async def main():
                 )
 
                 checked = [apply_network_cost(o, network_catalog) for o in checked]
+
+                for o in checked:
+                    if o.network_checked and not o.network_route_available:
+                        log.info("NETWORK_REJECT %s %s->%s | %s",
+                                 o.base, o.buy_exchange, o.sell_exchange, o.network_note)
 
                 for o in checked:
                     key = (o.base, o.buy_exchange, o.sell_exchange)
