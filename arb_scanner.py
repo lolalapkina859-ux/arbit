@@ -18,7 +18,8 @@ MEXC_BASE = "https://api.mexc.com"
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
 MIN_NET_SPREAD_PCT = float(os.getenv("MIN_NET_SPREAD_PCT", "0.20"))
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1000000"))
-TRADE_SIZE_USDT = float(os.getenv("TRADE_SIZE_USDT", "300"))
+MAX_TRADE_USDT = float(os.getenv("MAX_TRADE_USDT", "100"))
+MIN_TRADE_USDT = float(os.getenv("MIN_TRADE_USDT", "10"))
 MAX_GROSS_SPREAD_PCT = float(os.getenv("MAX_GROSS_SPREAD_PCT", "8.0"))
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "90"))
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "5"))
@@ -65,6 +66,9 @@ class Opportunity:
     exec_buy_avg: float = 0.0
     exec_sell_avg: float = 0.0
     exec_net_pct: float = -999.0
+    exec_amount_usdt: float = 0.0
+    exec_profit_usdt: float = 0.0
+    alive_seconds: int = 0
     executable: bool = False
 
 def fnum(x):
@@ -229,7 +233,22 @@ async def fetch_book(session, exchange, symbol):
     if exchange == "OKX":
         d = await get_json(session, f"{OKX_BASE}/api/v5/market/books", {"instId":symbol,"sz":"100"})
         rows = d.get("data", [])
-        if rows: return rows[0].get("bids", []), rows[0].get("asks", [])
+        if rows:
+            return rows[0].get("bids", []), rows[0].get("asks", [])
+    if exchange == "HTX":
+        d = await get_json(session, f"{HTX_BASE}/market/depth",
+                           {"symbol":symbol,"type":"step0","depth":"20"})
+        tick = d.get("tick", {})
+        return tick.get("bids", []), tick.get("asks", [])
+    if exchange == "KUCOIN":
+        d = await get_json(session, f"{KUCOIN_BASE}/api/v1/market/orderbook/level2_20",
+                           {"symbol":symbol})
+        data = d.get("data", {})
+        return data.get("bids", []), data.get("asks", [])
+    if exchange == "MEXC":
+        d = await get_json(session, f"{MEXC_BASE}/api/v3/depth",
+                           {"symbol":symbol,"limit":"100"})
+        return d.get("bids", []), d.get("asks", [])
     return [], []
 
 def buy_avg_from_asks(asks, quote_amount):
@@ -258,25 +277,67 @@ def sell_avg_from_bids(bids, base_amount):
     if remaining > 1e-9 or sold <= 0: return None, None
     return received/sold, received
 
+def evaluate_trade_size(o, asks, bids, amount_usdt):
+    buy_avg, base_qty = buy_avg_from_asks(asks, amount_usdt)
+    if buy_avg is None:
+        return None
+    sell_avg, quote_received = sell_avg_from_bids(bids, base_qty)
+    if sell_avg is None:
+        return None
+
+    buy_fee = amount_usdt * FEES_PCT[o.buy_exchange] / 100.0
+    sell_fee = quote_received * FEES_PCT[o.sell_exchange] / 100.0
+    profit = quote_received - amount_usdt - buy_fee - sell_fee
+    net_pct = profit / amount_usdt * 100.0
+
+    return buy_avg, sell_avg, net_pct, profit
+
 async def enrich_with_depth(session, o):
     try:
         (_, buy_asks), (sell_bids, _) = await asyncio.gather(
             fetch_book(session, o.buy_exchange, o.buy_symbol),
             fetch_book(session, o.sell_exchange, o.sell_symbol),
         )
-        buy_avg, base_qty = buy_avg_from_asks(buy_asks, TRADE_SIZE_USDT)
-        if buy_avg is None: return o
-        sell_avg, quote_received = sell_avg_from_bids(sell_bids, base_qty)
-        if sell_avg is None: return o
-        buy_fee = TRADE_SIZE_USDT * FEES_PCT[o.buy_exchange] / 100.0
-        sell_fee = quote_received * FEES_PCT[o.sell_exchange] / 100.0
-        net_profit = quote_received - TRADE_SIZE_USDT - buy_fee - sell_fee
-        o.exec_buy_avg = buy_avg
-        o.exec_sell_avg = sell_avg
-        o.exec_net_pct = net_profit / TRADE_SIZE_USDT * 100.0
-        o.executable = o.exec_net_pct >= MIN_NET_SPREAD_PCT
+
+        # First check whether even the minimum size is worth doing.
+        min_eval = evaluate_trade_size(o, buy_asks, sell_bids, MIN_TRADE_USDT)
+        if min_eval is None or min_eval[2] < MIN_NET_SPREAD_PCT:
+            return o
+
+        # If the whole $100 (or configured max) fits profitably, use it.
+        max_eval = evaluate_trade_size(o, buy_asks, sell_bids, MAX_TRADE_USDT)
+        if max_eval is not None and max_eval[2] >= MIN_NET_SPREAD_PCT:
+            chosen_amount = MAX_TRADE_USDT
+            chosen = max_eval
+        else:
+            # Find the largest profitable amount to about $0.10 precision.
+            lo = MIN_TRADE_USDT
+            hi = MAX_TRADE_USDT
+            chosen_amount = MIN_TRADE_USDT
+            chosen = min_eval
+
+            for _ in range(12):
+                mid = (lo + hi) / 2.0
+                ev = evaluate_trade_size(o, buy_asks, sell_bids, mid)
+                if ev is not None and ev[2] >= MIN_NET_SPREAD_PCT:
+                    chosen_amount = mid
+                    chosen = ev
+                    lo = mid
+                else:
+                    hi = mid
+
+            chosen_amount = round(chosen_amount, 2)
+
+        o.exec_buy_avg = chosen[0]
+        o.exec_sell_avg = chosen[1]
+        o.exec_net_pct = chosen[2]
+        o.exec_profit_usdt = chosen[3]
+        o.exec_amount_usdt = chosen_amount
+        o.executable = chosen_amount >= MIN_TRADE_USDT and o.exec_net_pct >= MIN_NET_SPREAD_PCT
+
     except Exception as e:
-        log.warning("Depth check failed %s %s->%s: %s", o.base, o.buy_exchange, o.sell_exchange, e)
+        log.warning("Depth check failed %s %s->%s: %s",
+                    o.base, o.buy_exchange, o.sell_exchange, e)
     return o
 
 def fmt_price(v):
@@ -289,20 +350,29 @@ def fmt_money(v):
     if v >= 1000: return f"$" + f"{v/1000:.1f}K"
     return f"$" + f"{v:.0f}"
 
+def fmt_duration(seconds):
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, rem = divmod(m, 60)
+    return f"{h}h {rem}m"
+
 def opp_text(o):
-    profit = TRADE_SIZE_USDT * o.exec_net_pct / 100.0
     return (
-        f"🚨 CEX ARBITRAGE\n{o.base}/USDT\n\n"
-        f"🟢 BUY  {o.buy_exchange}\nTop ask: {fmt_price(o.buy_ask)}\n"
-        f"Avg for $" + f"{TRADE_SIZE_USDT:.0f}: {fmt_price(o.exec_buy_avg)}\n\n"
-        f"🔴 SELL {o.sell_exchange}\nTop bid: {fmt_price(o.sell_bid)}\n"
-        f"Avg for size: {fmt_price(o.exec_sell_avg)}\n\n"
-        f"Top-book gross: +{o.gross_pct:.3f}%\n"
-        f"Fees est.: -{o.fees_pct:.3f}%\n"
-        f"REAL NET after depth: +{o.exec_net_pct:.3f}%\n"
-        f"Est. profit on $" + f"{TRADE_SIZE_USDT:.0f}: $" + f"{profit:.2f}\n"
+        f"🔥 CEX ARBITRAGE\n{o.base}/USDT\n\n"
+        f"🟢 BUY  {o.buy_exchange}\n"
+        f"Price: {fmt_price(o.exec_buy_avg)}\n\n"
+        f"🔴 SELL {o.sell_exchange}\n"
+        f"Price: {fmt_price(o.exec_sell_avg)}\n\n"
+        f"Spread top: +{o.gross_pct:.3f}%\n"
+        f"REAL NET: +{o.exec_net_pct:.3f}%\n"
+        f"Available amount: $" + f"{o.exec_amount_usdt:.2f}\n"
+        f"Est. profit: $" + f"{o.exec_profit_usdt:.2f}\n"
+        f"Alive: {fmt_duration(o.alive_seconds)}\n"
         f"24h liquidity floor: {fmt_money(o.min_quote_volume_24h)}\n\n"
-        f"⚠️ Verify same asset/network and deposit/withdraw status before trading."
+        f"⚠️ Before transfer verify common network, deposit/withdraw status and withdrawal fee."
     )
 
 async def send_telegram(session, text):
@@ -316,13 +386,14 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v3 — 6 exchanges")
-    log.info("Trade size for depth check: $%.0f", TRADE_SIZE_USDT)
+    log.info("Starting CEX arbitrage scanner v4 — 6 exchanges")
+    log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
     log.info("Reject gross spread above: %.2f%%", MAX_GROSS_SPREAD_PCT)
     connector = aiohttp.TCPConnector(limit=60, ttl_dns_cache=300)
     headers = {"User-Agent":"cex-arb-scanner/railway-v2"}
     last_alert = {}
+    first_seen = {}
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         while True:
             started = time.time()
@@ -341,12 +412,41 @@ async def main():
                     if isinstance(result, Exception): log.warning("%s fetch failed: %s", name, result)
                     else: markets[name] = result
                 candidates = find_candidates(markets)
+                now = time.time()
+
+                active_keys = set()
+                for o in candidates:
+                    key = (o.base, o.buy_exchange, o.sell_exchange)
+                    active_keys.add(key)
+                    if key not in first_seen:
+                        first_seen[key] = now
+
+                for key in list(first_seen.keys()):
+                    if key not in active_keys:
+                        del first_seen[key]
+
                 log.info("%s | candidates:%d",
                          " | ".join(f"{k}:{len(v)}" for k,v in markets.items()), len(candidates))
-                checked = await asyncio.gather(*(enrich_with_depth(session,o) for o in candidates[:20]))
+
+                checked = await asyncio.gather(
+                    *(enrich_with_depth(session,o) for o in candidates[:30])
+                )
+
+                for o in checked:
+                    key = (o.base, o.buy_exchange, o.sell_exchange)
+                    o.alive_seconds = int(now - first_seen.get(key, now))
+
                 opps = sorted([o for o in checked if o.executable],
-                              key=lambda x:x.exec_net_pct, reverse=True)
-                now = time.time(); sent = 0
+                              key=lambda x:(x.exec_profit_usdt, x.exec_net_pct),
+                              reverse=True)
+
+                for o in opps[:5]:
+                    log.info("TOP %s %s->%s | amount $%.2f | net %.3f%% | profit $%.2f | alive %ss",
+                             o.base, o.buy_exchange, o.sell_exchange,
+                             o.exec_amount_usdt, o.exec_net_pct,
+                             o.exec_profit_usdt, o.alive_seconds)
+
+                sent = 0
                 for o in opps:
                     if sent >= MAX_ALERTS_PER_CYCLE: break
                     key = (o.base,o.buy_exchange,o.sell_exchange)
