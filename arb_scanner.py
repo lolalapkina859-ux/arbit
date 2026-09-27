@@ -236,6 +236,18 @@ def norm_network(name):
                 return canonical
     return s
 
+def canonical_network(*names):
+    known = {"INJ","ETH","BSC","TRX","ARBITRUM","OPTIMISM","SOL","POLYGON","AVAXC","ONE","BASE"}
+    normalized = []
+    for name in names:
+        n = norm_network(name)
+        if n:
+            normalized.append(n)
+    for n in normalized:
+        if n in known:
+            return n
+    return normalized[0] if normalized else ""
+
 async def fetch_htx_networks(session):
     d = await get_json(session, f"{HTX_BASE}/v2/reference/currencies", {"authorizedUser":"false"})
     out = {}
@@ -243,10 +255,16 @@ async def fetch_htx_networks(session):
         base = str(coin.get("currency", "")).upper()
         rows = []
         for ch in coin.get("chains", []):
-            raw_name = ch.get("baseChainProtocol") or ch.get("baseChain") or ch.get("displayName") or ch.get("chain")
+            raw_name = ch.get("displayName") or ch.get("baseChain") or ch.get("baseChainProtocol") or ch.get("chain")
+            network = canonical_network(
+                ch.get("baseChain"),
+                ch.get("baseChainProtocol"),
+                ch.get("displayName"),
+                ch.get("chain")
+            )
             fee_type = str(ch.get("withdrawFeeType", "")).lower()
             fee = fnum(ch.get("transactFeeWithdraw")) if fee_type == "fixed" else fnum(ch.get("minTransactFeeWithdraw"))
-            rows.append({"network": norm_network(raw_name), "raw": raw_name or ch.get("chain",""),
+            rows.append({"network": network, "raw": raw_name or ch.get("chain",""),
                          "withdraw": ch.get("withdrawStatus") == "allowed",
                          "deposit": ch.get("depositStatus") == "allowed",
                          "fee": fee, "confirms": int(fnum(ch.get("numOfConfirmations")))})
@@ -261,8 +279,9 @@ async def fetch_kucoin_networks(session):
         rows = []
         for ch in coin.get("chains", []):
             raw_name = ch.get("chainName") or ch.get("chainId")
+            network = canonical_network(ch.get("chainName"), ch.get("chainId"))
             fee = fnum(ch.get("withdrawMinFee") or ch.get("withdrawalMinFee"))
-            rows.append({"network": norm_network(raw_name), "raw": raw_name or "",
+            rows.append({"network": network, "raw": raw_name or "",
                          "withdraw": bool(ch.get("isWithdrawEnabled")),
                          "deposit": bool(ch.get("isDepositEnabled")),
                          "fee": fee, "confirms": int(fnum(ch.get("confirms")))})
@@ -303,23 +322,35 @@ async def refresh_network_catalog(session):
 def choose_common_network(o, catalog):
     src = catalog.get(o.buy_exchange, {}).get(o.base, [])
     dst = catalog.get(o.sell_exchange, {}).get(o.base, [])
-    if not src or not dst: return None
+
+    if not src or not dst:
+        log.info(
+            "NETWORK_DATA_MISSING %s %s->%s | src_count=%d | dst_count=%d",
+            o.base, o.buy_exchange, o.sell_exchange, len(src), len(dst)
+        )
+        return None
+
     dst_by_net = {}
     for d in dst:
-        if d.get("deposit"): dst_by_net.setdefault(d.get("network"), []).append(d)
+        if d.get("deposit"):
+            dst_by_net.setdefault(d.get("network"), []).append(d)
+
     candidates = []
     for s in src:
-        if not s.get("withdraw"): continue
-        for d in dst_by_net.get(s.get("network"), []): candidates.append((s, d))
+        if not s.get("withdraw"):
+            continue
+        for d in dst_by_net.get(s.get("network"), []):
+            candidates.append((s, d))
+
     if not candidates:
-        if src and dst:
-            log.info(
-                "NETWORK_MISS %s %s->%s | src=%s | dst=%s",
-                o.base, o.buy_exchange, o.sell_exchange,
-                [(x.get("raw"), x.get("network"), x.get("withdraw")) for x in src],
-                [(x.get("raw"), x.get("network"), x.get("deposit")) for x in dst]
-            )
+        log.info(
+            "NETWORK_MISS %s %s->%s | src=%s | dst=%s",
+            o.base, o.buy_exchange, o.sell_exchange,
+            [(x.get("raw"), x.get("network"), x.get("withdraw"), x.get("fee")) for x in src],
+            [(x.get("raw"), x.get("network"), x.get("deposit")) for x in dst]
+        )
         return None
+
     candidates.sort(key=lambda x: x[0].get("fee", 0.0))
     return candidates[0]
 
@@ -513,9 +544,13 @@ def opp_text(o):
         )
         cost_line = f"Комиссия сети: -${o.withdraw_fee_usdt:.2f}\n"
     else:
+        if o.buy_exchange in ("HTX","KUCOIN","MEXC") and o.sell_exchange in ("HTX","KUCOIN","MEXC"):
+            reason = "Публичные данные есть, но общая активная сеть пока не сопоставлена."
+        else:
+            reason = "Для одной из бирж сеть пока не проверяется автоматически."
         network_block = (
-            f"🌐 Сеть: ⚠️ не проверена автоматически\n"
-            f"Для этой биржи нужен read-only API доступ к данным кошелька.\n"
+            f"🌐 Сеть: ⚠️ не подтверждена\n"
+            f"{reason}\n"
         )
         cost_line = f"Резерв на перевод/ребаланс: -${REBALANCE_COST_USDT:.2f}\n"
     return (
@@ -547,7 +582,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v10.1 — syntax fix")
+    log.info("Starting CEX arbitrage scanner v11 — stronger network matching")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
