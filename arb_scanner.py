@@ -10,7 +10,7 @@ import aiohttp
 
 BINANCE_BASE = "https://api.binance.com"
 BYBIT_BASE = "https://api.bybit.com"
-OKX_BASE = "https://www.okx.com"
+OKX_BASE = "https://www.okx.com"\nHTX_BASE = "https://api.huobi.pro"\nKUCOIN_BASE = "https://api.kucoin.com"\nMEXC_BASE = "https://api.mexc.com"
 
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
 MIN_NET_SPREAD_PCT = float(os.getenv("MIN_NET_SPREAD_PCT", "0.20"))
@@ -105,6 +105,74 @@ async def fetch_bybit(session):
         ask = fnum(t.get("ask1Price")); bid = fnum(t.get("bid1Price")); vol = fnum(t.get("turnover24h"))
         if ask > 0 and bid > 0:
             out[base] = Quote("BYBIT", sym, base, ask, bid, vol)
+    return out
+
+
+async def fetch_htx(session):
+    symbols, ticks = await asyncio.gather(
+        get_json(session, f"{HTX_BASE}/v1/common/symbols"),
+        get_json(session, f"{HTX_BASE}/market/tickers"),
+    )
+    allowed = {}
+    for s in symbols.get("data", []):
+        if s.get("state") == "online" and s.get("quote-currency") == "usdt":
+            allowed[s.get("symbol")] = str(s.get("base-currency", "")).upper()
+    out = {}
+    for t in ticks.get("data", []):
+        sym = t.get("symbol")
+        base = allowed.get(sym)
+        if not base or base in STABLE_BASES:
+            continue
+        ask = fnum(t.get("ask"))
+        bid = fnum(t.get("bid"))
+        vol = fnum(t.get("amount")) * fnum(t.get("close"))
+        if ask > 0 and bid > 0:
+            out[base] = Quote("HTX", sym, base, ask, bid, vol)
+    return out
+
+async def fetch_kucoin(session):
+    symbols, ticks = await asyncio.gather(
+        get_json(session, f"{KUCOIN_BASE}/api/v2/symbols"),
+        get_json(session, f"{KUCOIN_BASE}/api/v1/market/allTickers"),
+    )
+    allowed = {}
+    for s in symbols.get("data", []):
+        if s.get("enableTrading") and s.get("quoteCurrency") == "USDT":
+            allowed[s.get("symbol")] = s.get("baseCurrency")
+    out = {}
+    ticker_rows = ticks.get("data", {}).get("ticker", [])
+    for t in ticker_rows:
+        sym = t.get("symbol")
+        base = allowed.get(sym)
+        if not base or base in STABLE_BASES:
+            continue
+        ask = fnum(t.get("sell"))
+        bid = fnum(t.get("buy"))
+        vol = fnum(t.get("volValue"))
+        if ask > 0 and bid > 0:
+            out[base] = Quote("KUCOIN", sym, base, ask, bid, vol)
+    return out
+
+async def fetch_mexc(session):
+    info, ticks = await asyncio.gather(
+        get_json(session, f"{MEXC_BASE}/api/v3/exchangeInfo"),
+        get_json(session, f"{MEXC_BASE}/api/v3/ticker/24hr"),
+    )
+    allowed = {}
+    for s in info.get("symbols", []):
+        if s.get("status") in ("ENABLED", "TRADING", "1") and s.get("quoteAsset") == "USDT":
+            allowed[s.get("symbol")] = s.get("baseAsset")
+    out = {}
+    for t in ticks:
+        sym = t.get("symbol")
+        base = allowed.get(sym)
+        if not base or base in STABLE_BASES:
+            continue
+        ask = fnum(t.get("askPrice"))
+        bid = fnum(t.get("bidPrice"))
+        vol = fnum(t.get("quoteVolume"))
+        if ask > 0 and bid > 0:
+            out[base] = Quote("MEXC", sym, base, ask, bid, vol)
     return out
 
 async def fetch_okx(session):
@@ -242,7 +310,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v2")
+    log.info("Starting CEX arbitrage scanner v3 — 6 exchanges")
     log.info("Trade size for depth check: $%.0f", TRADE_SIZE_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
     log.info("Reject gross spread above: %.2f%%", MAX_GROSS_SPREAD_PCT)
