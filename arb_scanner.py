@@ -23,6 +23,8 @@ MIN_TRADE_USDT = float(os.getenv("MIN_TRADE_USDT", "10"))
 MAX_GROSS_SPREAD_PCT = float(os.getenv("MAX_GROSS_SPREAD_PCT", "8.0"))
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "90"))
 REARM_SECONDS = int(os.getenv("REARM_SECONDS", "120"))
+REBALANCE_COST_USDT = float(os.getenv("REBALANCE_COST_USDT", "0.70"))
+MIN_FINAL_PROFIT_USDT = float(os.getenv("MIN_FINAL_PROFIT_USDT", "1.00"))
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "5"))
 
 FEES_PCT = {
@@ -69,6 +71,8 @@ class Opportunity:
     exec_net_pct: float = -999.0
     exec_amount_usdt: float = 0.0
     exec_profit_usdt: float = 0.0
+    final_profit_usdt: float = 0.0
+    final_net_pct: float = -999.0
     alive_seconds: int = 0
     executable: bool = False
 
@@ -334,7 +338,16 @@ async def enrich_with_depth(session, o):
         o.exec_net_pct = chosen[2]
         o.exec_profit_usdt = chosen[3]
         o.exec_amount_usdt = chosen_amount
-        o.executable = chosen_amount >= MIN_TRADE_USDT and o.exec_net_pct >= MIN_NET_SPREAD_PCT
+
+        # Conservative estimate: reserve a flat amount for later capital rebalance.
+        o.final_profit_usdt = o.exec_profit_usdt - REBALANCE_COST_USDT
+        o.final_net_pct = (o.final_profit_usdt / o.exec_amount_usdt) * 100.0 if o.exec_amount_usdt > 0 else -999.0
+
+        o.executable = (
+            chosen_amount >= MIN_TRADE_USDT
+            and o.exec_net_pct >= MIN_NET_SPREAD_PCT
+            and o.final_profit_usdt >= MIN_FINAL_PROFIT_USDT
+        )
 
     except Exception as e:
         log.warning("Depth check failed %s %s->%s: %s",
@@ -368,12 +381,15 @@ def opp_text(o):
         f"🔴 ПРОДАТЬ: {o.sell_exchange}\n"
         f"Цена: {fmt_price(o.exec_sell_avg)}\n\n"
         f"Спред по лучшим ценам: +{o.gross_pct:.3f}%\n"
-        f"РЕАЛЬНЫЙ NET: +{o.exec_net_pct:.3f}%\n"
+        f"NET после торговых комиссий: +{o.exec_net_pct:.3f}%\n"
         f"Рабочий объём: $" + f"{o.exec_amount_usdt:.2f}\n"
-        f"Ожидаемая прибыль: $" + f"{o.exec_profit_usdt:.2f}\n"
+        f"Прибыль до ребаланса: $" + f"{o.exec_profit_usdt:.2f}\n"
+        f"Резерв на ребаланс: -$" + f"{REBALANCE_COST_USDT:.2f}\n"
+        f"ЧИСТАЯ прибыль: $" + f"{o.final_profit_usdt:.2f}\n"
+        f"ЧИСТЫЙ NET: +{o.final_net_pct:.3f}%\n"
         f"Спред живёт: {fmt_duration(o.alive_seconds)}\n"
         f"24ч ликвидность: {fmt_money(o.min_quote_volume_24h)}\n\n"
-        f"⚠️ Перед переводом проверь общую сеть, ввод/вывод и комиссию сети."
+        f"⚠️ Ребаланс здесь оценочный. Перед сделкой проверь реальную сеть, комиссию вывода и ввод/вывод на обеих биржах."
     )
 
 async def send_telegram(session, text):
@@ -387,8 +403,9 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v6 — persistent anti-spam per coin")
+    log.info("Starting CEX arbitrage scanner v7 — rebalance-aware profit filter")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
+    log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
     log.info("Reject gross spread above: %.2f%%", MAX_GROSS_SPREAD_PCT)
     connector = aiohttp.TCPConnector(limit=60, ttl_dns_cache=300)
@@ -440,17 +457,17 @@ async def main():
                     o.alive_seconds = int(now - first_seen.get(key, now))
 
                 opps = sorted([o for o in checked if o.executable],
-                              key=lambda x:(x.exec_profit_usdt, x.exec_net_pct),
+                              key=lambda x:(x.final_profit_usdt, x.final_net_pct),
                               reverse=True)
 
                 # Только одна лучшая связка на монету.
                 best_by_base = {}
                 for o in opps:
                     current = best_by_base.get(o.base)
-                    if current is None or (o.exec_profit_usdt, o.exec_net_pct) > (current.exec_profit_usdt, current.exec_net_pct):
+                    if current is None or (o.final_profit_usdt, o.final_net_pct) > (current.final_profit_usdt, current.final_net_pct):
                         best_by_base[o.base] = o
                 opps = sorted(best_by_base.values(),
-                              key=lambda x:(x.exec_profit_usdt, x.exec_net_pct),
+                              key=lambda x:(x.final_profit_usdt, x.final_net_pct),
                               reverse=True)
 
                 # Повтор по монете запрещён, пока прибыльная возможность не исчезла.
@@ -467,10 +484,10 @@ async def main():
                             last_alert.pop(base, None)
 
                 for o in opps[:5]:
-                    log.info("TOP %s %s->%s | amount $%.2f | net %.3f%% | profit $%.2f | alive %ss",
+                    log.info("TOP %s %s->%s | amount $%.2f | trade_net %.3f%% | final_net %.3f%% | final_profit $%.2f | alive %ss",
                              o.base, o.buy_exchange, o.sell_exchange,
                              o.exec_amount_usdt, o.exec_net_pct,
-                             o.exec_profit_usdt, o.alive_seconds)
+                             o.final_net_pct, o.final_profit_usdt, o.alive_seconds)
 
                 sent = 0
                 for o in opps:
