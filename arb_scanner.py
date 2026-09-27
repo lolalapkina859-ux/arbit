@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
+import hashlib
+import hmac
 import logging
 import os
 import time
+from datetime import datetime, timezone
+from urllib.parse import urlencode
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -39,6 +44,16 @@ FEES_PCT = {
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+
+OKX_API_KEY = os.getenv("OKX_API_KEY", "")
+OKX_API_SECRET = os.getenv("OKX_API_SECRET", "")
+OKX_API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
 STABLE_BASES = {"USDT","USDC","FDUSD","TUSD","DAI","USDE","USDS","PYUSD"}
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
@@ -250,6 +265,119 @@ def canonical_network(*names):
             return n
     return normalized[0] if normalized else ""
 
+async def fetch_binance_networks(session):
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        return {}
+    params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+    query = urlencode(params)
+    signature = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    url = f"{BINANCE_BASE}/sapi/v1/capital/config/getall?{query}&signature={signature}"
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with session.get(url, headers=headers, timeout=timeout) as r:
+        r.raise_for_status()
+        data = await r.json()
+    out = {}
+    for coin in data:
+        base = str(coin.get("coin", "")).upper()
+        rows = []
+        for n in coin.get("networkList", []):
+            raw_name = n.get("name") or n.get("network")
+            network = canonical_network(n.get("network"), n.get("name"))
+            rows.append({
+                "network": network,
+                "raw": raw_name or "",
+                "withdraw": bool(n.get("withdrawEnable")),
+                "deposit": bool(n.get("depositEnable")),
+                "fee": fnum(n.get("withdrawFee")),
+                "confirms": int(fnum(n.get("minConfirm")))
+            })
+        if rows:
+            out[base] = rows
+    return out
+
+async def fetch_bybit_networks(session):
+    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        return {}
+    timestamp = str(int(time.time() * 1000))
+    recv_window = "5000"
+    query = ""
+    payload = timestamp + BYBIT_API_KEY + recv_window + query
+    signature = hmac.new(BYBIT_API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN": signature
+    }
+    url = f"{BYBIT_BASE}/v5/asset/coin/query-info"
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with session.get(url, headers=headers, timeout=timeout) as r:
+        r.raise_for_status()
+        d = await r.json()
+    if d.get("retCode") not in (0, None):
+        raise RuntimeError(f"Bybit retCode={d.get('retCode')} retMsg={d.get('retMsg')}")
+    out = {}
+    for coin in d.get("result", {}).get("rows", []):
+        base = str(coin.get("coin", "")).upper()
+        rows = []
+        for ch in coin.get("chains", []):
+            raw_name = ch.get("chainType") or ch.get("chain")
+            network = canonical_network(ch.get("chainType"), ch.get("chain"))
+            fee = fnum(ch.get("withdrawFee"))
+            rows.append({
+                "network": network,
+                "raw": raw_name or "",
+                "withdraw": str(ch.get("chainWithdraw")) == "1",
+                "deposit": str(ch.get("chainDeposit")) == "1",
+                "fee": fee,
+                "confirms": int(fnum(ch.get("confirmation")))
+            })
+        if rows:
+            out[base] = rows
+    return out
+
+def okx_iso_timestamp():
+    now = datetime.now(timezone.utc)
+    return now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+async def fetch_okx_networks(session):
+    if not OKX_API_KEY or not OKX_API_SECRET or not OKX_API_PASSPHRASE:
+        return {}
+    request_path = "/api/v5/asset/currencies"
+    timestamp = okx_iso_timestamp()
+    prehash = timestamp + "GET" + request_path
+    digest = hmac.new(OKX_API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()
+    signature = base64.b64encode(digest).decode()
+    headers = {
+        "OK-ACCESS-KEY": OKX_API_KEY,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": OKX_API_PASSPHRASE
+    }
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with session.get(f"{OKX_BASE}{request_path}", headers=headers, timeout=timeout) as r:
+        r.raise_for_status()
+        d = await r.json()
+    if d.get("code") not in ("0", 0, None):
+        raise RuntimeError(f"OKX code={d.get('code')} msg={d.get('msg')}")
+    out = {}
+    for item in d.get("data", []):
+        base = str(item.get("ccy", "")).upper()
+        raw_chain = item.get("chain") or ""
+        # OKX often returns values like "USDT-TRC20" or "ETH-ERC20".
+        tail = raw_chain.split("-")[-1] if raw_chain else raw_chain
+        network = canonical_network(tail, raw_chain)
+        row = {
+            "network": network,
+            "raw": raw_chain,
+            "withdraw": bool(item.get("canWd")),
+            "deposit": bool(item.get("canDep")),
+            "fee": fnum(item.get("fee")),
+            "confirms": int(fnum(item.get("minDepArrivalConfirm")))
+        }
+        out.setdefault(base, []).append(row)
+    return out
 async def fetch_htx_networks(session):
     d = await get_json(session, f"{HTX_BASE}/v2/reference/currencies", {"authorizedUser":"false"})
     out = {}
@@ -344,7 +472,7 @@ async def fetch_mexc_networks(session):
     return out
 
 async def refresh_network_catalog(session):
-    funcs = {"HTX": fetch_htx_networks, "KUCOIN": fetch_kucoin_networks, "MEXC": fetch_mexc_networks}
+    funcs = {"BINANCE": fetch_binance_networks, "BYBIT": fetch_bybit_networks, "OKX": fetch_okx_networks, "HTX": fetch_htx_networks, "KUCOIN": fetch_kucoin_networks, "MEXC": fetch_mexc_networks}
     catalog = {}
     for name, fn in funcs.items():
         try:
@@ -642,8 +770,9 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v13 — reject routes without common active network")
+    log.info("Starting CEX arbitrage scanner v14 — Binance Bybit OKX private network metadata")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
+    log.info("Private network APIs configured | Binance:%s | Bybit:%s | OKX:%s", bool(BINANCE_API_KEY and BINANCE_API_SECRET), bool(BYBIT_API_KEY and BYBIT_API_SECRET), bool(OKX_API_KEY and OKX_API_SECRET and OKX_API_PASSPHRASE))
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
     log.info("Reject gross spread above: %.2f%%", MAX_GROSS_SPREAD_PCT)
@@ -681,7 +810,10 @@ async def main():
                         network_catalog = fresh_catalog
                         network_catalog_ts = now
                         log.info(
-                            "Network catalog ready | HTX:%d | KUCOIN:%d | MEXC:%d",
+                            "Network catalog ready | BINANCE:%d | BYBIT:%d | OKX:%d | HTX:%d | KUCOIN:%d | MEXC:%d",
+                            len(network_catalog.get("BINANCE", {})),
+                            len(network_catalog.get("BYBIT", {})),
+                            len(network_catalog.get("OKX", {})),
                             len(network_catalog.get("HTX", {})),
                             len(network_catalog.get("KUCOIN", {})),
                             len(network_catalog.get("MEXC", {}))
