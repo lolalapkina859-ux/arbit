@@ -327,9 +327,16 @@ async def main():
         while True:
             started = time.time()
             try:
-                results = await asyncio.gather(fetch_binance(session), fetch_bybit(session),
-                                               fetch_okx(session), return_exceptions=True)
-                names = ["BINANCE","BYBIT","OKX"]; markets = {}
+                results = await asyncio.gather(
+                    fetch_binance(session),
+                    fetch_bybit(session),
+                    fetch_okx(session),
+                    fetch_htx(session),
+                    fetch_kucoin(session),
+                    fetch_mexc(session),
+                    return_exceptions=True
+                )
+                names = ["BINANCE","BYBIT","OKX","HTX","KUCOIN","MEXC"]; markets = {}
                 for name, result in zip(names, results):
                     if isinstance(result, Exception): log.warning("%s fetch failed: %s", name, result)
                     else: markets[name] = result
