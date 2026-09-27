@@ -25,6 +25,7 @@ ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "90"))
 REARM_SECONDS = int(os.getenv("REARM_SECONDS", "120"))
 REBALANCE_COST_USDT = float(os.getenv("REBALANCE_COST_USDT", "0.70"))
 MIN_FINAL_PROFIT_USDT = float(os.getenv("MIN_FINAL_PROFIT_USDT", "1.00"))
+NETWORK_REFRESH_SECONDS = int(os.getenv("NETWORK_REFRESH_SECONDS", "300"))
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "5"))
 
 FEES_PCT = {
@@ -73,6 +74,11 @@ class Opportunity:
     exec_profit_usdt: float = 0.0
     final_profit_usdt: float = 0.0
     final_net_pct: float = -999.0
+    network_name: str = ""
+    network_verified: bool = False
+    withdraw_fee_token: float = 0.0
+    withdraw_fee_usdt: float = 0.0
+    network_note: str = ""
     alive_seconds: int = 0
     executable: bool = False
 
@@ -205,6 +211,102 @@ async def fetch_okx(session):
         if ask > 0 and bid > 0:
             out[base] = Quote("OKX", sym, base, ask, bid, vol)
     return out
+
+def norm_network(name):
+    s = str(name or "").upper().replace(" ", "").replace("-", "").replace("_", "")
+    aliases = {
+        "ERC20": "ETH", "ETHEREUM": "ETH", "ETH": "ETH",
+        "BEP20": "BSC", "BSC": "BSC", "BNBSMARTCHAIN": "BSC",
+        "TRC20": "TRX", "TRON": "TRX", "TRX": "TRX",
+        "ARBITRUMONE": "ARBITRUM", "ARBITRUM": "ARBITRUM", "ARB": "ARBITRUM",
+        "OPTIMISM": "OPTIMISM", "OP": "OPTIMISM",
+        "SOLANA": "SOL", "SOL": "SOL",
+        "POLYGON": "POLYGON", "MATIC": "POLYGON",
+        "AVALANCHECCHAIN": "AVAXC", "AVAXC": "AVAXC",
+        "INJECTIVE": "INJ", "INJ": "INJ",
+        "HARMONY": "ONE", "ONE": "ONE",
+        "BASE": "BASE"
+    }
+    return aliases.get(s, s)
+
+async def fetch_htx_networks(session):
+    d = await get_json(session, f"{HTX_BASE}/v2/reference/currencies", {"authorizedUser":"false"})
+    out = {}
+    for coin in d.get("data", []):
+        base = str(coin.get("currency", "")).upper()
+        rows = []
+        for ch in coin.get("chains", []):
+            raw_name = ch.get("displayName") or ch.get("baseChainProtocol") or ch.get("baseChain") or ch.get("chain")
+            fee_type = str(ch.get("withdrawFeeType", "")).lower()
+            fee = fnum(ch.get("transactFeeWithdraw")) if fee_type == "fixed" else fnum(ch.get("minTransactFeeWithdraw"))
+            rows.append({"network": norm_network(raw_name), "raw": raw_name or ch.get("chain",""),
+                         "withdraw": ch.get("withdrawStatus") == "allowed",
+                         "deposit": ch.get("depositStatus") == "allowed",
+                         "fee": fee, "confirms": int(fnum(ch.get("numOfConfirmations")))})
+        if rows: out[base] = rows
+    return out
+
+async def fetch_kucoin_networks(session):
+    d = await get_json(session, f"{KUCOIN_BASE}/api/v3/currencies")
+    out = {}
+    for coin in d.get("data", []):
+        base = str(coin.get("currency", "")).upper()
+        rows = []
+        for ch in coin.get("chains", []):
+            raw_name = ch.get("chainName") or ch.get("chainId")
+            fee = fnum(ch.get("withdrawMinFee") or ch.get("withdrawalMinFee"))
+            rows.append({"network": norm_network(raw_name), "raw": raw_name or "",
+                         "withdraw": bool(ch.get("isWithdrawEnabled")),
+                         "deposit": bool(ch.get("isDepositEnabled")),
+                         "fee": fee, "confirms": int(fnum(ch.get("confirms")))})
+        if rows: out[base] = rows
+    return out
+
+async def fetch_mexc_networks(session):
+    d = await get_json(session, "https://www.mexc.com/open/api/v2/market/coin/list")
+    out = {}
+    for item in d.get("data", []):
+        base = str(item.get("currency", "")).upper()
+        chain_rows = item.get("coins") or item.get("chains") or []
+        if not chain_rows and item.get("chain"): chain_rows = [item]
+        rows = []
+        for ch in chain_rows:
+            raw_name = ch.get("chain") or ch.get("netWork") or ch.get("network")
+            w = str(ch.get("is_withdraw_enabled", ch.get("isWithdrawEnabled", ""))).lower() in ("true","1","yes")
+            dpt = str(ch.get("is_deposit_enabled", ch.get("isDepositEnabled", ""))).lower() in ("true","1","yes")
+            rows.append({"network": norm_network(raw_name), "raw": raw_name or "",
+                         "withdraw": w, "deposit": dpt,
+                         "fee": fnum(ch.get("fee") or ch.get("withdrawFee")),
+                         "confirms": int(fnum(ch.get("deposit_minConfirm") or ch.get("minConfirm")))})
+        if rows: out[base] = rows
+    return out
+
+async def refresh_network_catalog(session):
+    funcs = {"HTX": fetch_htx_networks, "KUCOIN": fetch_kucoin_networks, "MEXC": fetch_mexc_networks}
+    catalog = {}
+    for name, fn in funcs.items():
+        try:
+            data = await fn(session)
+            catalog[name] = data
+            log.info("Network metadata %s: %d coins", name, len(data))
+        except Exception as e:
+            log.warning("Network metadata %s failed: %s", name, e)
+    return catalog
+
+def choose_common_network(o, catalog):
+    src = catalog.get(o.buy_exchange, {}).get(o.base, [])
+    dst = catalog.get(o.sell_exchange, {}).get(o.base, [])
+    if not src or not dst: return None
+    dst_by_net = {}
+    for d in dst:
+        if d.get("deposit"): dst_by_net.setdefault(d.get("network"), []).append(d)
+    candidates = []
+    for s in src:
+        if not s.get("withdraw"): continue
+        for d in dst_by_net.get(s.get("network"), []): candidates.append((s, d))
+    if not candidates: return None
+    candidates.sort(key=lambda x: x[0].get("fee", 0.0))
+    return candidates[0]
 
 def find_candidates(markets):
     bases = set()
@@ -339,19 +441,32 @@ async def enrich_with_depth(session, o):
         o.exec_profit_usdt = chosen[3]
         o.exec_amount_usdt = chosen_amount
 
-        # Conservative estimate: reserve a flat amount for later capital rebalance.
         o.final_profit_usdt = o.exec_profit_usdt - REBALANCE_COST_USDT
         o.final_net_pct = (o.final_profit_usdt / o.exec_amount_usdt) * 100.0 if o.exec_amount_usdt > 0 else -999.0
-
-        o.executable = (
-            chosen_amount >= MIN_TRADE_USDT
-            and o.exec_net_pct >= MIN_NET_SPREAD_PCT
-            and o.final_profit_usdt >= MIN_FINAL_PROFIT_USDT
-        )
+        o.executable = chosen_amount >= MIN_TRADE_USDT and o.exec_net_pct >= MIN_NET_SPREAD_PCT
 
     except Exception as e:
         log.warning("Depth check failed %s %s->%s: %s",
                     o.base, o.buy_exchange, o.sell_exchange, e)
+    return o
+
+def apply_network_cost(o, catalog):
+    match = choose_common_network(o, catalog)
+    if match:
+        src, dst = match
+        o.network_name = src.get("raw") or src.get("network") or ""
+        o.network_verified = True
+        o.withdraw_fee_token = fnum(src.get("fee"))
+        o.withdraw_fee_usdt = o.withdraw_fee_token * o.exec_buy_avg
+        o.network_note = "withdraw ✅ / deposit ✅"
+        o.final_profit_usdt = o.exec_profit_usdt - o.withdraw_fee_usdt
+        o.final_net_pct = (o.final_profit_usdt / o.exec_amount_usdt) * 100.0 if o.exec_amount_usdt > 0 else -999.0
+    else:
+        o.network_verified = False
+        o.network_note = "сеть не проверена автоматически"
+        o.final_profit_usdt = o.exec_profit_usdt - REBALANCE_COST_USDT
+        o.final_net_pct = (o.final_profit_usdt / o.exec_amount_usdt) * 100.0 if o.exec_amount_usdt > 0 else -999.0
+    o.executable = o.executable and o.final_profit_usdt >= MIN_FINAL_PROFIT_USDT
     return o
 
 def fmt_price(v):
@@ -374,22 +489,36 @@ def fmt_duration(seconds):
     return f"{h} ч {rem} мин"
 
 def opp_text(o):
+    if o.network_verified:
+        network_block = (
+            f"🌐 Сеть: {o.network_name}\n"
+            f"Вывод с {o.buy_exchange}: ✅\n"
+            f"Ввод на {o.sell_exchange}: ✅\n"
+            f"Комиссия вывода: {o.withdraw_fee_token:g} {o.base} (~${o.withdraw_fee_usdt:.2f})\n"
+        )
+        cost_line = f"Комиссия сети: -${o.withdraw_fee_usdt:.2f}\n"
+    else:
+        network_block = (
+            f"🌐 Сеть: ⚠️ не проверена автоматически\n"
+            f"Для этой биржи нужен read-only API доступ к данным кошелька.\n"
+        )
+        cost_line = f"Резерв на перевод/ребаланс: -${REBALANCE_COST_USDT:.2f}\n"
     return (
         f"🔥 ЛУЧШИЙ АРБИТРАЖ\n{o.base}/USDT\n\n"
         f"🟢 КУПИТЬ: {o.buy_exchange}\n"
         f"Цена: {fmt_price(o.exec_buy_avg)}\n\n"
         f"🔴 ПРОДАТЬ: {o.sell_exchange}\n"
         f"Цена: {fmt_price(o.exec_sell_avg)}\n\n"
-        f"Спред по лучшим ценам: +{o.gross_pct:.3f}%\n"
+        f"{network_block}\n"
+        f"Спред: +{o.gross_pct:.3f}%\n"
         f"NET после торговых комиссий: +{o.exec_net_pct:.3f}%\n"
-        f"Рабочий объём: $" + f"{o.exec_amount_usdt:.2f}\n"
-        f"Прибыль до ребаланса: $" + f"{o.exec_profit_usdt:.2f}\n"
-        f"Резерв на ребаланс: -$" + f"{REBALANCE_COST_USDT:.2f}\n"
-        f"ЧИСТАЯ прибыль: $" + f"{o.final_profit_usdt:.2f}\n"
+        f"Рабочий объём: ${o.exec_amount_usdt:.2f}\n"
+        f"Прибыль до сети: ${o.exec_profit_usdt:.2f}\n"
+        f"{cost_line}"
+        f"ЧИСТАЯ прибыль: ${o.final_profit_usdt:.2f}\n"
         f"ЧИСТЫЙ NET: +{o.final_net_pct:.3f}%\n"
         f"Спред живёт: {fmt_duration(o.alive_seconds)}\n"
-        f"24ч ликвидность: {fmt_money(o.min_quote_volume_24h)}\n\n"
-        f"⚠️ Ребаланс здесь оценочный. Перед сделкой проверь реальную сеть, комиссию вывода и ввод/вывод на обеих биржах."
+        f"24ч ликвидность: {fmt_money(o.min_quote_volume_24h)}"
     )
 
 async def send_telegram(session, text):
@@ -403,7 +532,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v7 — rebalance-aware profit filter")
+    log.info("Starting CEX arbitrage scanner v8 — network and withdrawal fee aware")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
@@ -414,6 +543,8 @@ async def main():
     first_seen = {}
     alerted_bases = set()
     inactive_since = {}
+    network_catalog = {}
+    network_catalog_ts = 0.0
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         while True:
             started = time.time()
@@ -434,6 +565,12 @@ async def main():
                 candidates = find_candidates(markets)
                 now = time.time()
 
+                if not network_catalog or now - network_catalog_ts >= NETWORK_REFRESH_SECONDS:
+                    fresh_catalog = await refresh_network_catalog(session)
+                    if fresh_catalog:
+                        network_catalog = fresh_catalog
+                        network_catalog_ts = now
+
                 active_keys = set()
                 for o in candidates:
                     key = (o.base, o.buy_exchange, o.sell_exchange)
@@ -451,6 +588,8 @@ async def main():
                 checked = await asyncio.gather(
                     *(enrich_with_depth(session,o) for o in candidates[:30])
                 )
+
+                checked = [apply_network_cost(o, network_catalog) for o in checked]
 
                 for o in checked:
                     key = (o.base, o.buy_exchange, o.sell_exchange)
