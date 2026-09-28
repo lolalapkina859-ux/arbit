@@ -26,6 +26,9 @@ REARM_SECONDS = int(os.getenv("REARM_SECONDS", "120"))
 REBALANCE_COST_USDT = float(os.getenv("REBALANCE_COST_USDT", "0.70"))
 MIN_FINAL_PROFIT_USDT = float(os.getenv("MIN_FINAL_PROFIT_USDT", "1.00"))
 NETWORK_REFRESH_SECONDS = int(os.getenv("NETWORK_REFRESH_SECONDS", "300"))
+MAX_NETWORK_CONFIRMATIONS = int(os.getenv("MAX_NETWORK_CONFIRMATIONS", "20"))
+BLOCKED_ASSETS = {x.strip().upper() for x in os.getenv("BLOCKED_ASSETS", "PONS").split(",") if x.strip()}
+BLOCKED_NETWORKS = {x.strip().upper() for x in os.getenv("BLOCKED_NETWORKS", "ROBINHOOD").split(",") if x.strip()}
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "5"))
 
 FEES_PCT = {
@@ -79,6 +82,7 @@ class Opportunity:
     withdraw_fee_token: float = 0.0
     withdraw_fee_usdt: float = 0.0
     network_note: str = ""
+    network_confirms: int = 0
     network_checked: bool = False
     network_route_available: bool = False
     alive_seconds: int = 0
@@ -395,6 +399,8 @@ def find_candidates(markets):
     for m in markets.values(): bases.update(m.keys())
     found = []
     for base in bases:
+        if base.upper() in BLOCKED_ASSETS:
+            continue
         quotes = [m[base] for m in markets.values() if base in m]
         if len(quotes) < 2: continue
         for buy in quotes:
@@ -548,9 +554,19 @@ def apply_network_cost(o, catalog):
         o.network_route_available = True
         o.withdraw_fee_token = fnum(src.get("fee"))
         o.withdraw_fee_usdt = o.withdraw_fee_token * o.exec_buy_avg
+        o.network_confirms = max(int(fnum(src.get("confirms"))), int(fnum(dst.get("confirms"))))
         o.network_note = "withdraw ✅ / deposit ✅"
-        o.final_profit_usdt = o.exec_profit_usdt - o.withdraw_fee_usdt
-        o.final_net_pct = (o.final_profit_usdt / o.exec_amount_usdt) * 100.0 if o.exec_amount_usdt > 0 else -999.0
+
+        raw_net = str(o.network_name or "").upper()
+        if raw_net in BLOCKED_NETWORKS or o.network_confirms > MAX_NETWORK_CONFIRMATIONS:
+            o.network_route_available = False
+            o.network_note = f"медленная сеть / подтверждений: {o.network_confirms}"
+            o.final_profit_usdt = -999.0
+            o.final_net_pct = -999.0
+        else:
+            o.final_profit_usdt = o.exec_profit_usdt - o.withdraw_fee_usdt
+        if o.network_route_available:
+            o.final_net_pct = (o.final_profit_usdt / o.exec_amount_usdt) * 100.0 if o.exec_amount_usdt > 0 else -999.0
     elif o.network_checked:
         # Both exchanges supplied network metadata for this asset, but no common enabled route exists.
         o.network_verified = True
@@ -598,6 +614,7 @@ def opp_text(o):
             f"Вывод с {o.buy_exchange}: ✅\n"
             f"Ввод на {o.sell_exchange}: ✅\n"
             f"Комиссия вывода: {o.withdraw_fee_token:g} {o.base} (~${o.withdraw_fee_usdt:.2f})\n"
+            f"Подтверждений: {o.network_confirms}\n"
         )
         cost_line = f"Комиссия сети: -${o.withdraw_fee_usdt:.2f}\n"
     elif o.network_checked and not o.network_route_available:
@@ -642,9 +659,10 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v14.1 — public APIs only")
+    log.info("Starting CEX arbitrage scanner v15 — slow network filter")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
+    log.info("Slow filter | max confirmations:%d | blocked assets:%s | blocked networks:%s", MAX_NETWORK_CONFIRMATIONS, sorted(BLOCKED_ASSETS), sorted(BLOCKED_NETWORKS))
     log.info("NET threshold: %.3f%%", MIN_NET_SPREAD_PCT)
     log.info("Reject gross spread above: %.2f%%", MAX_GROSS_SPREAD_PCT)
     connector = aiohttp.TCPConnector(limit=60, ttl_dns_cache=300)
