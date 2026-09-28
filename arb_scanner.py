@@ -75,6 +75,8 @@ class Opportunity:
     exec_sell_avg: float = 0.0
     exec_net_pct: float = -999.0
     exec_amount_usdt: float = 0.0
+    exec_base_qty: float = 0.0
+    received_base_qty: float = 0.0
     exec_profit_usdt: float = 0.0
     final_profit_usdt: float = 0.0
     final_net_pct: float = -999.0
@@ -529,6 +531,8 @@ async def enrich_with_depth(session, o):
         o.exec_net_pct = chosen[2]
         o.exec_profit_usdt = chosen[3]
         o.exec_amount_usdt = chosen_amount
+        o.exec_base_qty = chosen_amount / o.exec_buy_avg if o.exec_buy_avg > 0 else 0.0
+        o.received_base_qty = o.exec_base_qty
 
         o.final_profit_usdt = o.exec_profit_usdt - REBALANCE_COST_USDT
         o.final_net_pct = (o.final_profit_usdt / o.exec_amount_usdt) * 100.0 if o.exec_amount_usdt > 0 else -999.0
@@ -573,7 +577,9 @@ def apply_network_cost(o, catalog):
         o.network_verified = True
         o.network_route_available = True
         o.withdraw_fee_token = fnum(src.get("fee"))
-        o.withdraw_fee_usdt = o.withdraw_fee_token * o.exec_buy_avg
+        o.received_base_qty = max(0.0, o.exec_base_qty - o.withdraw_fee_token)
+        # Withdrawal fee is paid in the transferred coin, so value it at the sell side.
+        o.withdraw_fee_usdt = o.withdraw_fee_token * o.exec_sell_avg
         o.network_confirms = max(int(fnum(src.get("confirms"))), int(fnum(dst.get("confirms"))))
         o.network_note = "withdraw ✅ / deposit ✅"
 
@@ -581,6 +587,11 @@ def apply_network_cost(o, catalog):
         if raw_net in BLOCKED_NETWORKS or o.network_confirms > MAX_NETWORK_CONFIRMATIONS:
             o.network_route_available = False
             o.network_note = f"медленная сеть / подтверждений: {o.network_confirms}"
+            o.final_profit_usdt = -999.0
+            o.final_net_pct = -999.0
+        elif o.received_base_qty <= 0:
+            o.network_route_available = False
+            o.network_note = "комиссия вывода съедает объём"
             o.final_profit_usdt = -999.0
             o.final_net_pct = -999.0
         else:
@@ -637,7 +648,9 @@ def opp_text(o):
             f"🌐 Сеть: {o.network_name}\n"
             f"Вывод с {o.buy_exchange}: ✅\n"
             f"Ввод на {o.sell_exchange}: ✅\n"
+            f"Купим: {o.exec_base_qty:.6f} {o.base}\n"
             f"Комиссия вывода: {o.withdraw_fee_token:g} {o.base} (~${o.withdraw_fee_usdt:.2f})\n"
+            f"Придёт на {o.sell_exchange}: {o.received_base_qty:.6f} {o.base}\n"
             f"Подтверждений: {o.network_confirms}\n"
         )
         cost_line = f"Комиссия сети: -${o.withdraw_fee_usdt:.2f}\n"
@@ -683,7 +696,7 @@ async def send_telegram(session, text):
         log.warning("Telegram exception: %s", e)
 
 async def main():
-    log.info("Starting CEX arbitrage scanner v16 — SAFE verified-network-only mode")
+    log.info("Starting CEX arbitrage scanner v17 — net received quantity accounting")
     log.info("Capital cap: $%.0f | minimum useful size: $%.0f", MAX_TRADE_USDT, MIN_TRADE_USDT)
     log.info("Rebalance reserve: $%.2f | minimum final profit: $%.2f", REBALANCE_COST_USDT, MIN_FINAL_PROFIT_USDT)
     log.info("Slow filter | max confirmations:%d | blocked assets:%s | blocked networks:%s", MAX_NETWORK_CONFIRMATIONS, sorted(BLOCKED_ASSETS), sorted(BLOCKED_NETWORKS))
@@ -797,10 +810,10 @@ async def main():
                         fee_desc = f"${REBALANCE_COST_USDT:.2f}"
 
                     log.info(
-                        "TOP %s %s->%s | amount $%.2f | trade_net %.3f%% | network=%s | fee_source=%s | withdraw_fee=%s | trade_profit $%.2f | final_net %.3f%% | final_profit $%.2f | alive %ss",
+                        "TOP %s %s->%s | amount $%.2f | trade_net %.3f%% | network=%s | fee_source=%s | withdraw_fee=%s | received_qty=%.8f | trade_profit $%.2f | final_net %.3f%% | final_profit $%.2f | alive %ss",
                         o.base, o.buy_exchange, o.sell_exchange,
                         o.exec_amount_usdt, o.exec_net_pct,
-                        network, fee_source, fee_desc,
+                        network, fee_source, fee_desc, o.received_base_qty,
                         o.exec_profit_usdt, o.final_net_pct,
                         o.final_profit_usdt, o.alive_seconds
                     )
